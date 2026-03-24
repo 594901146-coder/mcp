@@ -1,3 +1,3 @@
 mcp[cli]>=1.0.0
 pyserial>=3.5
-mqtt-as>=0.18.0
+paho-mqtt>=2.0.0

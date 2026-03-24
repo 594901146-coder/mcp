@@ -21,6 +21,7 @@ License: MIT
 import asyncio
 import json
 import os
+import threading
 from typing import Literal, Optional
 from contextlib import asynccontextmanager
 
@@ -44,14 +45,6 @@ MQTT_PASSWORD: str = os.getenv("MQTT_PASSWORD", "")
 MQTT_BASE_TOPIC: str = os.getenv("MQTT_BASE_TOPIC", "hardware/bridge")
 
 DEVICE_ID: str = os.getenv("DEVICE_ID", "esp32s3_001")
-
-# ==============================================================================
-# MQTT Message Types
-# ==============================================================================
-
-class MQTTMessage:
-    OUTGOING = "outgoing"
-    RESPONSE = "response"
 
 # ==============================================================================
 # Hardware Interface Base
@@ -132,35 +125,71 @@ class MQTTInterface(HardwareInterface):
     def __init__(self):
         self._client = None
         self._connected = False
+        self._loop = None
+        self._thread = None
         self._response_event = asyncio.Event()
         self._last_response = ""
+        self._pending_commands = {}
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode('utf-8')
+            
+            if "response" in topic:
+                for cmd_id, future in self._pending_commands.items():
+                    if cmd_id in topic:
+                        self._last_response = payload
+                        self._pending_commands.pop(cmd_id, None)
+                        self._response_event.set()
+                        break
+        except Exception as e:
+            print(f"[MQTT] Message callback error: {e}")
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            print(f"[MQTT] Connected to {MQTT_BROKER}:{MQTT_PORT}")
+            client.subscribe(f"{MQTT_BASE_TOPIC}/{DEVICE_ID}/response/+")
+            client.subscribe(f"{MQTT_BASE_TOPIC}/broadcast/response/+")
+        else:
+            print(f"[MQTT] Connection failed with code {rc}")
+
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _start_network_loop(self):
+        def network_thread():
+            while self._connected:
+                if self._client and self._client.want_write():
+                    self._client.loop_write()
+                if self._client and self._client.loop_read():
+                    break
+                if self._client and self._client.loop_misc():
+                    pass
+                import time
+                time.sleep(0.01)
+
+        self._thread = threading.Thread(target=network_thread, daemon=True)
+        self._thread.start()
 
     async def connect(self) -> bool:
         try:
-            import mqtt_as
+            import paho.mqtt.client as mqtt
 
-            async def callback(topic, msg, retained):
-                if "response" in topic:
-                    self._last_response = msg.decode('utf-8')
-                    self._response_event.set()
+            self._client = mqtt.Client(client_id=f"mcp_{DEVICE_ID}")
+            self._client.on_connect = self._on_connect
+            self._client.on_message = self._on_message
 
-            config = {
-                'broker': MQTT_BROKER,
-                'port': MQTT_PORT,
-                'username': MQTT_USERNAME or None,
-                'password': MQTT_PASSWORD or None,
-                'queue_len': 0,
-            }
+            if MQTT_USERNAME and MQTT_PASSWORD:
+                self._client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
-            self._client = mqtt_as.MQTTHub(**config)
-            self._client.subscribe(f"{MQTT_BASE_TOPIC}/{DEVICE_ID}/response/+", 1)
-            self._client.subscribe(f"{MQTT_BASE_TOPIC}/broadcast/response/+", 1)
-
-            await self._client.connect()
-            self._client.subscribe.callback = callback
-
+            self._client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
             self._connected = True
-            print(f"[MQTT] Connected to {MQTT_BROKER}:{MQTT_PORT}")
+
+            self._start_network_loop()
+            
             return True
         except Exception as e:
             print(f"[ERROR] MQTT connection failed: {e}")
@@ -168,15 +197,13 @@ class MQTTInterface(HardwareInterface):
 
     async def disconnect(self) -> None:
         if self._client:
-            await self._client.aclose()
+            self._client.disconnect()
         self._connected = False
         print("[MQTT] Disconnected")
 
     async def send_command(self, command: str, timeout: float = 5.0) -> str:
-        if not self._connected:
+        if not self._connected or not self._client:
             raise RuntimeError("MQTT not connected")
-
-        self._response_event.clear()
 
         cmd_id = f"{DEVICE_ID}_{int(asyncio.get_event_loop().time() * 1000)}"
         topic = f"{MQTT_BASE_TOPIC}/{DEVICE_ID}/command/{cmd_id}"
@@ -184,12 +211,17 @@ class MQTTInterface(HardwareInterface):
         payload = json.dumps({
             "command": command,
             "device_id": DEVICE_ID,
-            "command_id": cmd_id,
-            "timestamp": asyncio.get_event_loop().time()
+            "command_id": cmd_id
         })
 
         print(f"[MQTT] TX to {topic}: {command}")
-        await self._client.publish(topic, payload, qos=1)
+        
+        self._response_event.clear()
+        self._pending_commands[cmd_id] = True
+        
+        result = self._client.publish(topic, payload, qos=1)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            return f"ACK:ERROR:publish_failed"
 
         try:
             await asyncio.wait_for(
